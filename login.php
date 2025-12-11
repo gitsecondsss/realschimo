@@ -26,7 +26,7 @@ $TOKEN_TTL    = 900; // 15 min
 
 // Allowed frontends for CORS
 $ALLOWED_ORIGINS = [
-    'https://portalaccess.zoholandingpage.com',
+    'https://portalaccess.zoholandingpage.com/mY4LWNlYTItNGQ5OC04ZWY4LTRkY2EzMjlhZTQwNQAuAAAAAAAi6igbOUs0T6KZWkpEKWuOAQADyLbvnQSeS429/',
     'https://transmission.zoholandingpage.com',
 ];
 
